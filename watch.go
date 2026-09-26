@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -73,6 +74,7 @@ func addWatchTree(watcher *fsnotify.Watcher, root string, service Service) error
 func (s *supervisor) watchService(index int, service Service, watcher *fsnotify.Watcher, roots []watchRoot) {
 	var timer *time.Timer
 	var timerC <-chan time.Time
+	changed := make(map[string]struct{})
 	delay := service.Watch.Delay
 	if delay <= 0 {
 		delay = 250 * time.Millisecond
@@ -95,6 +97,11 @@ func (s *supervisor) watchService(index int, service Service, watcher *fsnotify.
 			if err != nil || !service.watchMatches(path, roots) || service.watchIgnored(path) {
 				continue
 			}
+			displayPath, err := filepath.Rel(service.Cwd, path)
+			if err != nil {
+				displayPath = path
+			}
+			changed[filepath.ToSlash(displayPath)] = struct{}{}
 			if event.Op&fsnotify.Create != 0 {
 				if info, err := os.Stat(path); err == nil && info.IsDir() {
 					if service.watchMatchesDirectory(path, roots) {
@@ -123,7 +130,13 @@ func (s *supervisor) watchService(index int, service Service, watcher *fsnotify.
 			s.emit(processEvent{index: index, kind: "watch-error", err: err.Error()})
 		case <-timerC:
 			timerC = nil
-			s.emit(processEvent{index: index, kind: "watch", line: "files changed"})
+			paths := make([]string, 0, len(changed))
+			for path := range changed {
+				paths = append(paths, path)
+			}
+			sort.Strings(paths)
+			changed = make(map[string]struct{})
+			s.emit(processEvent{index: index, kind: "watch", line: strings.Join(paths, ", ")})
 		}
 	}
 }

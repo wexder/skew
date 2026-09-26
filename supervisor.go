@@ -60,7 +60,7 @@ func (s *supervisor) start(index int) {
 	service := s.services[index]
 	cmd := exec.Command("sh", "-c", service.Command)
 	cmd.Dir = service.Cwd
-	cmd.Env = serviceEnvironment(service.Env)
+	cmd.Env = serviceEnvironment(service.Env, service.Color == nil || *service.Color)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -117,13 +117,24 @@ func (s *supervisor) start(index int) {
 	}()
 }
 
-func serviceEnvironment(extra map[string]string) []string {
+func serviceEnvironment(extra map[string]string, forceColor bool) []string {
 	env := make(map[string]string)
 	for _, value := range os.Environ() {
 		key, val, ok := strings.Cut(value, "=")
 		if ok {
 			env[key] = val
 		}
+	}
+	if forceColor {
+		env["FORCE_COLOR"] = "1"
+		env["CLICOLOR_FORCE"] = "1"
+		if env["TERM"] == "" || env["TERM"] == "dumb" {
+			env["TERM"] = "xterm-256color"
+		}
+		if env["COLORTERM"] == "" {
+			env["COLORTERM"] = "truecolor"
+		}
+		delete(env, "NO_COLOR")
 	}
 	for key, value := range extra {
 		env[key] = value

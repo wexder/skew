@@ -18,8 +18,8 @@ services:
     env:
       LOG_LEVEL: debug
     watch:
-      paths: [cmd/api, internal]
-      ignore: ["**/*_test.go"]
+      paths: [.] # Recursively watch the service's working directory.
+      ignore: [.git, node_modules, dist, build]
       debounce: 250ms
 
   - name: web
@@ -33,6 +33,10 @@ services:
 Commands are shell strings executed with `sh -c`. Relative `cwd` values are
 resolved from the directory containing the config file. Configured environment
 variables are added to the current environment or replace matching variables.
+Service output color is enabled by default by setting common force-color environment
+variables for child commands; set `color: false` on a service to disable that
+behavior. Values under `env` take precedence over the defaults. ANSI colors in
+command output are preserved in the log panels.
 Each service can set `watch.paths` to files or directories to monitor. Directories
 are watched recursively. A matching change restarts that service; stopped
 services stay stopped. `watch.ignore` accepts paths or glob patterns relative to

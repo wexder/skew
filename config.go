@@ -19,6 +19,7 @@ type Service struct {
 	Command string            `yaml:"command"`
 	Cwd     string            `yaml:"cwd"`
 	Env     map[string]string `yaml:"env"`
+	Color   *bool             `yaml:"color"`
 	Watch   WatchConfig       `yaml:"watch"`
 }
 

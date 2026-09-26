@@ -97,7 +97,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.waitForEventCmd()
 			}
 			if event.kind == "watch" {
-				state.lines = append(state.lines, "[watch: files changed, restarting]")
+				state.lines = append(state.lines, "[watch: files changed ("+event.line+"), restarting]")
 				if state.status == "running" || state.status == "failed" || state.status == "exited" {
 					state.status = "starting"
 					return m, tea.Batch(m.restartCmd(event.index), m.waitForEventCmd())
