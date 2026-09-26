@@ -6,7 +6,7 @@ services:
       LOG_LEVEL: debug
     watch:
       paths: [.] # Recursively watch the service's working directory.
-      ignore: [.git, node_modules, dist, build]
+      ignore: [node_modules, dist, build]
       debounce: 250ms
 
   - name: web

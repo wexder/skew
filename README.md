@@ -19,7 +19,7 @@ services:
       LOG_LEVEL: debug
     watch:
       paths: [.] # Recursively watch the service's working directory.
-      ignore: [.git, node_modules, dist, build]
+      ignore: [node_modules, dist, build]
       debounce: 250ms
 
   - name: web
@@ -40,7 +40,8 @@ command output are preserved in the log panels.
 Each service can set `watch.paths` to files or directories to monitor. Directories
 are watched recursively. A matching change restarts that service; stopped
 services stay stopped. `watch.ignore` accepts paths or glob patterns relative to
-the service's working directory, including `**`. The default debounce is 250ms;
+the service's working directory, including `**`. The `.git` directory is always
+ignored. The default debounce is 250ms;
 set `watch.debounce` to another positive Go duration such as `500ms` to group
 rapid file changes.
 

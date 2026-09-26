@@ -165,6 +165,9 @@ func (service Service) watchIgnored(path string) bool {
 		return false
 	}
 	relative = filepath.ToSlash(relative)
+	if relative == ".git" || strings.HasPrefix(relative, ".git/") {
+		return true
+	}
 	for _, pattern := range service.Watch.Ignore {
 		pattern = strings.Trim(strings.TrimSpace(filepath.ToSlash(pattern)), "/")
 		if pattern == "" {
