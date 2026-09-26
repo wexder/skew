@@ -1,0 +1,20 @@
+services:
+  - name: api
+    command: go run ./cmd/api
+    cwd: .
+    env:
+      LOG_LEVEL: debug
+    watch:
+      paths: [cmd/api, internal]
+      ignore: ["**/*_test.go"]
+      debounce: 250ms
+
+  - name: web
+    command: pnpm dev
+    cwd: ./web
+    watch:
+      paths: [src]
+      ignore: [node_modules, .next]
+
+  - name: worker
+    command: go run ./cmd/worker
