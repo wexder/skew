@@ -24,7 +24,7 @@ func main() {
 		fatalf("%v", err)
 	}
 
-	model := newModel(services)
+	model := newModel(services, *configPath, *only)
 	program := tea.NewProgram(model)
 	if _, err := program.Run(); err != nil {
 		fatalf("run TUI: %v", err)

@@ -29,6 +29,19 @@ type serviceState struct {
 	scroll   int
 }
 
+func (s *serviceState) appendLine(line string) {
+	following := s.scroll == 0
+	s.lines = append(s.lines, line)
+	if len(s.lines) > maxStoredLines {
+		s.lines = append([]string(nil), s.lines[len(s.lines)-maxStoredLines:]...)
+	}
+	if following {
+		s.scroll = 0
+	} else {
+		s.scroll = min(len(s.lines)-1, s.scroll+1)
+	}
+}
+
 type model struct {
 	services       []Service
 	state          []serviceState
@@ -43,22 +56,26 @@ type model struct {
 	sidebarFocused bool
 	assigningPanel bool
 	quitting       bool
+	configPath     string
+	only           string
 }
 
 type processMsg processEvent
 type shutdownCompleteMsg struct{}
 
-func newModel(services []Service) model {
+func newModel(services []Service, configPath, only string) model {
 	state := make([]serviceState, len(services))
 	for i := range state {
 		state[i].status = "starting"
 	}
 	m := model{
-		services: services,
-		state:    state,
-		super:    newSupervisor(services),
-		width:    100,
-		height:   30,
+		services:   services,
+		state:      state,
+		super:      newSupervisor(services),
+		configPath: configPath,
+		only:       only,
+		width:      100,
+		height:     30,
 	}
 	m.resizePanels()
 	return m
@@ -71,6 +88,7 @@ func (m model) Init() tea.Cmd {
 func (m model) startAllCmd() tea.Cmd {
 	return func() tea.Msg {
 		m.super.startWatching()
+		m.super.startConfigWatching(m.configPath, m.only)
 		for i := range m.services {
 			m.super.start(i)
 		}
@@ -90,31 +108,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.selectService(m.selected)
 	case processMsg:
 		event := processEvent(msg)
-		if event.index >= 0 && event.index < len(m.state) {
-			state := &m.state[event.index]
+		if event.kind == "config-error" {
+			m.state[m.selected].appendLine("[config reload error: " + event.err + "]")
+			return m, m.waitForEventCmd()
+		}
+		if event.kind == "config-reload" {
+			cmd := m.applyServices(event.services)
+			return m, tea.Batch(cmd, m.waitForEventCmd())
+		}
+		index := event.index
+		if event.service != "" {
+			index = -1
+			for i, service := range m.services {
+				if service.Name == event.service {
+					index = i
+					break
+				}
+			}
+		}
+		if index >= 0 && index < len(m.state) {
+			state := &m.state[index]
 			if event.kind == "watch-error" {
-				state.lines = append(state.lines, "[watch error: "+event.err+"]")
+				state.appendLine("[watch error: " + event.err + "]")
 				return m, m.waitForEventCmd()
 			}
 			if event.kind == "watch" {
-				state.lines = append(state.lines, "[watch: files changed ("+event.line+"), restarting]")
+				state.appendLine("[watch: files changed (" + event.line + "), restarting]")
 				if state.status == "running" || state.status == "failed" || state.status == "exited" {
 					state.status = "starting"
-					return m, tea.Batch(m.restartCmd(event.index), m.waitForEventCmd())
+					return m, tea.Batch(m.restartCmd(index), m.waitForEventCmd())
 				}
 				return m, m.waitForEventCmd()
 			}
 			if event.kind == "started" {
-				state.runID = event.runID
-				state.status = "running"
-				state.exitCode = 0
-				state.scroll = 0
-			} else if event.kind == "line" && event.runID == state.runID {
-				state.lines = append(state.lines, event.line)
-				if len(state.lines) > maxStoredLines {
-					state.lines = append([]string(nil), state.lines[len(state.lines)-maxStoredLines:]...)
+				if event.runID >= state.runID {
+					state.runID = event.runID
+					state.status = "running"
+					state.exitCode = 0
 				}
-				state.scroll = min(state.scroll, max(0, len(state.lines)-1))
+			} else if event.kind == "line" && event.runID == state.runID {
+				state.appendLine(event.line)
 			} else if event.runID == state.runID {
 				switch event.kind {
 				case "stopped":
@@ -124,7 +157,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					state.status = "failed"
 					state.exitCode = event.exitCode
 					if event.err != "" {
-						state.lines = append(state.lines, "["+event.err+"]")
+						state.appendLine("[" + event.err + "]")
 					}
 				case "exited":
 					state.status = "exited"
@@ -273,6 +306,70 @@ func (m *model) resizePanels() {
 		}
 	}
 	m.focusedPanel = max(0, min(len(m.panels)-1, m.focusedPanel))
+}
+
+func (m *model) applyServices(services []Service) tea.Cmd {
+	oldServices, oldState := m.services, m.state
+	statesByName := make(map[string]serviceState, len(oldServices))
+	shouldRunByName := make(map[string]bool, len(oldServices))
+	for i, service := range oldServices {
+		statesByName[service.Name] = oldState[i]
+		shouldRunByName[service.Name] = oldState[i].status != "stopped" && oldState[i].status != "stopping"
+	}
+	oldSelected := ""
+	if m.selected >= 0 && m.selected < len(oldServices) {
+		oldSelected = oldServices[m.selected].Name
+	}
+	panelNames := make([]string, len(m.panels))
+	for i, index := range m.panels {
+		if index >= 0 && index < len(oldServices) {
+			panelNames[i] = oldServices[index].Name
+		}
+	}
+
+	newState := make([]serviceState, len(services))
+	shouldRun := make([]bool, len(services))
+	indexes := make(map[string]int, len(services))
+	for i, service := range services {
+		indexes[service.Name] = i
+		if previous, exists := statesByName[service.Name]; exists {
+			newState[i] = previous
+			shouldRun[i] = shouldRunByName[service.Name]
+		} else {
+			newState[i].status = "starting"
+			shouldRun[i] = true
+		}
+		newState[i].appendLine("[config reloaded]")
+		if shouldRun[i] {
+			newState[i].status = "starting"
+		}
+	}
+	m.services, m.state = services, newState
+	m.panels = nil
+	for _, name := range panelNames {
+		if index, exists := indexes[name]; exists {
+			present := false
+			for _, panelService := range m.panels {
+				if panelService == index {
+					present = true
+					break
+				}
+			}
+			if !present {
+				m.panels = append(m.panels, index)
+			}
+		}
+	}
+	m.selected = 0
+	if index, exists := indexes[oldSelected]; exists {
+		m.selected = index
+	}
+	m.resizePanels()
+	m.selectService(m.selected)
+	return func() tea.Msg {
+		m.super.reconfigure(services, shouldRun)
+		return nil
+	}
 }
 
 func (m *model) adjustPanelCount(delta int) {

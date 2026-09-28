@@ -18,11 +18,13 @@ const maxLogLine = 1024 * 1024
 
 type processEvent struct {
 	index    int
+	service  string
 	runID    uint64
 	kind     string
 	line     string
 	exitCode int
 	err      string
+	services []Service
 }
 
 type managedProcess struct {
@@ -33,12 +35,14 @@ type managedProcess struct {
 }
 
 type supervisor struct {
-	services []Service
-	events   chan processEvent
-	mu       sync.Mutex
-	process  map[int]*managedProcess
-	watchers []*fsnotify.Watcher
-	nextRun  uint64
+	services      []Service
+	events        chan processEvent
+	mu            sync.Mutex
+	lifecycleMu   sync.Mutex
+	process       map[int]*managedProcess
+	watchers      []*fsnotify.Watcher
+	configWatcher *fsnotify.Watcher
+	nextRun       uint64
 }
 
 func newSupervisor(services []Service) *supervisor {
@@ -50,6 +54,12 @@ func newSupervisor(services []Service) *supervisor {
 }
 
 func (s *supervisor) start(index int) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.startLocked(index)
+}
+
+func (s *supervisor) startLocked(index int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, running := s.process[index]; running {
@@ -64,29 +74,29 @@ func (s *supervisor) start(index int) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		s.emit(processEvent{index: index, runID: runID, kind: "failed", exitCode: -1, err: err.Error()})
+		s.emit(processEvent{index: index, service: service.Name, runID: runID, kind: "failed", exitCode: -1, err: err.Error()})
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		_ = stdout.Close()
-		s.emit(processEvent{index: index, runID: runID, kind: "failed", exitCode: -1, err: err.Error()})
+		s.emit(processEvent{index: index, service: service.Name, runID: runID, kind: "failed", exitCode: -1, err: err.Error()})
 		return
 	}
 	if err := cmd.Start(); err != nil {
 		_ = stdout.Close()
 		_ = stderr.Close()
-		s.emit(processEvent{index: index, runID: runID, kind: "failed", exitCode: -1, err: err.Error()})
+		s.emit(processEvent{index: index, service: service.Name, runID: runID, kind: "failed", exitCode: -1, err: err.Error()})
 		return
 	}
 	proc := &managedProcess{cmd: cmd, done: make(chan struct{}), runID: runID}
 	s.process[index] = proc
-	s.emit(processEvent{index: index, runID: proc.runID, kind: "started"})
+	s.emit(processEvent{index: index, service: service.Name, runID: proc.runID, kind: "started"})
 
 	var readers sync.WaitGroup
 	readers.Add(2)
-	go s.readOutput(&readers, stdout, index, proc.runID)
-	go s.readOutput(&readers, stderr, index, proc.runID)
+	go s.readOutput(&readers, stdout, index, service.Name, proc.runID)
+	go s.readOutput(&readers, stderr, index, service.Name, proc.runID)
 	go func() {
 		waitErr := cmd.Wait()
 		readers.Wait()
@@ -112,7 +122,7 @@ func (s *supervisor) start(index int) {
 		} else if code != 0 {
 			kind = "failed"
 		}
-		s.emit(processEvent{index: index, runID: proc.runID, kind: kind, exitCode: code, err: errText})
+		s.emit(processEvent{index: index, service: service.Name, runID: proc.runID, kind: kind, exitCode: code, err: errText})
 		close(proc.done)
 	}()
 }
@@ -151,15 +161,15 @@ func serviceEnvironment(extra map[string]string, forceColor bool) []string {
 	return out
 }
 
-func (s *supervisor) readOutput(readers *sync.WaitGroup, output interface{ Read([]byte) (int, error) }, index int, runID uint64) {
+func (s *supervisor) readOutput(readers *sync.WaitGroup, output interface{ Read([]byte) (int, error) }, index int, service string, runID uint64) {
 	defer readers.Done()
 	scanner := bufio.NewScanner(output)
 	scanner.Buffer(make([]byte, 64*1024), maxLogLine)
 	for scanner.Scan() {
-		s.emit(processEvent{index: index, runID: runID, kind: "line", line: scanner.Text()})
+		s.emit(processEvent{index: index, service: service, runID: runID, kind: "line", line: scanner.Text()})
 	}
 	if err := scanner.Err(); err != nil {
-		s.emit(processEvent{index: index, runID: runID, kind: "line", line: fmt.Sprintf("[output read error: %v]", err)})
+		s.emit(processEvent{index: index, service: service, runID: runID, kind: "line", line: fmt.Sprintf("[output read error: %v]", err)})
 	}
 }
 
@@ -168,6 +178,12 @@ func (s *supervisor) emit(event processEvent) {
 }
 
 func (s *supervisor) stop(index int) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.stopLocked(index)
+}
+
+func (s *supervisor) stopLocked(index int) {
 	s.mu.Lock()
 	proc := s.process[index]
 	if proc != nil {
@@ -188,15 +204,54 @@ func (s *supervisor) stop(index int) {
 }
 
 func (s *supervisor) stopAll() {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	var wait sync.WaitGroup
 	for i := range s.services {
 		wait.Add(1)
 		go func(index int) {
 			defer wait.Done()
-			s.stop(index)
+			s.stopLocked(index)
 		}(i)
 	}
 	wait.Wait()
+	s.mu.Lock()
+	watchers := s.watchers
+	s.watchers = nil
+	configWatcher := s.configWatcher
+	s.configWatcher = nil
+	s.mu.Unlock()
+	if configWatcher != nil {
+		_ = configWatcher.Close()
+	}
+	for _, watcher := range watchers {
+		_ = watcher.Close()
+	}
+}
+
+func (s *supervisor) reconfigure(services []Service, shouldRun []bool) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.mu.Lock()
+	oldServiceCount := len(s.services)
+	s.mu.Unlock()
+	for i := 0; i < oldServiceCount; i++ {
+		s.stopLocked(i)
+	}
+	s.closeServiceWatchers()
+	s.mu.Lock()
+	s.services = services
+	s.process = make(map[int]*managedProcess)
+	s.mu.Unlock()
+	s.startWatching()
+	for i, run := range shouldRun {
+		if run {
+			s.startLocked(i)
+		}
+	}
+}
+
+func (s *supervisor) closeServiceWatchers() {
 	s.mu.Lock()
 	watchers := s.watchers
 	s.watchers = nil
@@ -207,6 +262,8 @@ func (s *supervisor) stopAll() {
 }
 
 func (s *supervisor) restart(index int) {
-	s.stop(index)
-	s.start(index)
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.stopLocked(index)
+	s.startLocked(index)
 }

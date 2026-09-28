@@ -24,14 +24,14 @@ func (s *supervisor) startWatching() {
 		}
 		watcher, err := fsnotify.NewWatcher()
 		if err != nil {
-			s.emit(processEvent{index: index, kind: "watch-error", err: err.Error()})
+			s.emit(processEvent{index: index, service: service.Name, kind: "watch-error", err: err.Error()})
 			continue
 		}
 		roots := make([]watchRoot, 0, len(service.Watch.Paths))
 		for _, path := range service.Watch.Paths {
 			info, err := os.Stat(path)
 			if err != nil {
-				s.emit(processEvent{index: index, kind: "watch-error", err: fmt.Sprintf("watch %s: %v", path, err)})
+				s.emit(processEvent{index: index, service: service.Name, kind: "watch-error", err: fmt.Sprintf("watch %s: %v", path, err)})
 				continue
 			}
 			root := watchRoot{path: path, directory: info.IsDir()}
@@ -42,7 +42,7 @@ func (s *supervisor) startWatching() {
 				err = watcher.Add(filepath.Dir(path))
 			}
 			if err != nil {
-				s.emit(processEvent{index: index, kind: "watch-error", err: fmt.Sprintf("watch %s: %v", path, err)})
+				s.emit(processEvent{index: index, service: service.Name, kind: "watch-error", err: fmt.Sprintf("watch %s: %v", path, err)})
 			}
 		}
 		if len(roots) == 0 {
@@ -53,6 +53,79 @@ func (s *supervisor) startWatching() {
 		s.watchers = append(s.watchers, watcher)
 		s.mu.Unlock()
 		go s.watchService(index, service, watcher, roots)
+	}
+}
+
+func (s *supervisor) startConfigWatching(configPath, only string) {
+	absolutePath, err := filepath.Abs(configPath)
+	if err != nil {
+		s.emit(processEvent{kind: "config-error", err: fmt.Sprintf("resolve config path: %v", err)})
+		return
+	}
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		s.emit(processEvent{kind: "config-error", err: fmt.Sprintf("watch config: %v", err)})
+		return
+	}
+	if err := watcher.Add(filepath.Dir(absolutePath)); err != nil {
+		_ = watcher.Close()
+		s.emit(processEvent{kind: "config-error", err: fmt.Sprintf("watch config: %v", err)})
+		return
+	}
+	s.mu.Lock()
+	s.configWatcher = watcher
+	s.mu.Unlock()
+	go s.watchConfig(configPath, absolutePath, only, watcher)
+}
+
+func (s *supervisor) watchConfig(configPath, absolutePath, only string, watcher *fsnotify.Watcher) {
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		select {
+		case event, open := <-watcher.Events:
+			if !open {
+				return
+			}
+			if filepath.Clean(event.Name) != filepath.Clean(absolutePath) || event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) == 0 {
+				continue
+			}
+			if timer == nil {
+				timer = time.NewTimer(250 * time.Millisecond)
+			} else {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(250 * time.Millisecond)
+			}
+			timerC = timer.C
+		case err, open := <-watcher.Errors:
+			if !open {
+				return
+			}
+			s.emit(processEvent{kind: "config-error", err: fmt.Sprintf("watch config: %v", err)})
+		case <-timerC:
+			timerC = nil
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				s.emit(processEvent{kind: "config-error", err: err.Error()})
+				continue
+			}
+			services, err := selectServices(cfg.Services, only)
+			if err != nil {
+				s.emit(processEvent{kind: "config-error", err: err.Error()})
+				continue
+			}
+			s.emit(processEvent{kind: "config-reload", services: services})
+		}
 	}
 }
 
@@ -106,7 +179,7 @@ func (s *supervisor) watchService(index int, service Service, watcher *fsnotify.
 				if info, err := os.Stat(path); err == nil && info.IsDir() {
 					if service.watchMatchesDirectory(path, roots) {
 						if err := addWatchTree(watcher, path, service); err != nil {
-							s.emit(processEvent{index: index, kind: "watch-error", err: fmt.Sprintf("watch %s: %v", path, err)})
+							s.emit(processEvent{index: index, service: service.Name, kind: "watch-error", err: fmt.Sprintf("watch %s: %v", path, err)})
 						}
 					}
 				}
@@ -127,7 +200,7 @@ func (s *supervisor) watchService(index int, service Service, watcher *fsnotify.
 			if !open {
 				return
 			}
-			s.emit(processEvent{index: index, kind: "watch-error", err: err.Error()})
+			s.emit(processEvent{index: index, service: service.Name, kind: "watch-error", err: err.Error()})
 		case <-timerC:
 			timerC = nil
 			paths := make([]string, 0, len(changed))
@@ -136,7 +209,7 @@ func (s *supervisor) watchService(index int, service Service, watcher *fsnotify.
 			}
 			sort.Strings(paths)
 			changed = make(map[string]struct{})
-			s.emit(processEvent{index: index, kind: "watch", line: strings.Join(paths, ", ")})
+			s.emit(processEvent{index: index, service: service.Name, kind: "watch", line: strings.Join(paths, ", ")})
 		}
 	}
 }

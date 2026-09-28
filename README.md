@@ -44,6 +44,11 @@ the service's working directory, including `**`. The `.git` directory is always
 ignored. The default debounce is 250ms;
 set `watch.debounce` to another positive Go duration such as `500ms` to group
 rapid file changes.
+The config file passed with `-f` is also watched. A valid edit reloads the service
+list and restarts its configured commands; output and panel assignments are kept
+for services with the same name, and services you manually stopped stay stopped.
+Invalid YAML or service settings are shown in the dashboard and leave the current
+configuration running until the file is fixed.
 
 ## Run
 
